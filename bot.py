@@ -3,12 +3,36 @@ import telebot
 import requests
 from config import TOKEN
 from validators import normalize_kz_phone
+from models import UserProfile, BotAnswer, LoudBotAnswer, ServiceBotAnswer
 import database as db
 
 os.makedirs("files", exist_ok=True)
 
 bot = telebot.TeleBot(TOKEN)
 bot.remove_webhook()
+
+# Хранилище объектов пользователей в памяти (ЛР 5.2, Шаг 2)
+user_objects = {}
+
+# Словарь полиморфных объектов ответов (ЛР 5.2, Шаг 4)
+answers_map = {
+    "привет": BotAnswer("Здравствуйте! Рады видеть вас в магазине Apple Store Astana."),
+    "доставка": ServiceBotAnswer("Доставка осуществляется по левому и правому берегу Астаны."),
+    "пока": LoudBotAnswer("Спасибо за визит! Ждём вас снова"),
+}
+
+def get_or_create_user(message) -> UserProfile:
+    """Получает или создает объект класса UserProfile (ЛР 5.2)."""
+    chat_id = message.chat.id
+    if chat_id not in user_objects:
+        user_objects[chat_id] = UserProfile(
+            telegram_id=chat_id,
+            name=message.from_user.first_name or "Клиент"
+        )
+    user_obj = user_objects[chat_id]
+    user_obj.register_action()  # Вызов метода объекта
+    db.register_user(chat_id, user_obj.name)  # Дублируем в постоянную БД
+    return user_obj
 
 def query_ai_sales_manager(user_text: str) -> str:
     products = db.get_active_products()
@@ -35,27 +59,26 @@ def query_ai_sales_manager(user_text: str) -> str:
 
 @bot.message_handler(commands=["start"])
 def handle_start(message):
-    db.register_user(message.chat.id, message.from_user.first_name or "Клиент")
+    user = get_or_create_user(message)
     keyboard = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.add("🍏 Каталог", "🛒 Моя корзина", "📦 Оформить заказ")
     
-    user_name = message.from_user.first_name or "Клиент"
     welcome_text = (
-        f"Здравствуйте, {user_name}!\n"
+        f"Здравствуйте, {user.name}!\n"
         "Добро пожаловать в магазин Apple Store Astana.\n\n"
         "Команды:\n"
         "• /catalog — каталог товаров\n"
         "• /buy <товар> — добавить в корзину\n"
         "• /order — оформить заказ\n"
         "• /phone <номер> — сохранить телефон\n"
-        "• /stats — профиль\n\n"
+        "• /stats — профиль (объект ООП)\n\n"
         "Либо отправьте фото чека или напишите вопрос — ответит ИИ!"
     )
     bot.send_message(message.chat.id, welcome_text, reply_markup=keyboard)
 
 @bot.message_handler(commands=["catalog"])
 def handle_catalog(message):
-    db.register_user(message.chat.id, message.from_user.first_name or "Клиент")
+    get_or_create_user(message)
     products = db.get_active_products()
     lines = ["🍏 **Прайс-лист товаров:**\n"]
     for p in products:
@@ -66,7 +89,7 @@ def handle_catalog(message):
 
 @bot.message_handler(commands=["buy"])
 def handle_buy(message):
-    db.register_user(message.chat.id, message.from_user.first_name or "Клиент")
+    get_or_create_user(message)
     try:
         item_name = message.text.split(maxsplit=1)[1].strip()
         if db.add_product_to_cart(message.chat.id, item_name):
@@ -78,7 +101,7 @@ def handle_buy(message):
 
 @bot.message_handler(commands=["order"])
 def handle_order(message):
-    db.register_user(message.chat.id, message.from_user.first_name or "Клиент")
+    get_or_create_user(message)
     cart = db.get_user_cart(message.chat.id)
     if not cart:
         bot.send_message(message.chat.id, "🛒 Корзина пуста. Добавьте товары через /buy.")
@@ -97,12 +120,13 @@ def handle_order(message):
 
 @bot.message_handler(commands=["phone"])
 def handle_phone(message):
-    db.register_user(message.chat.id, message.from_user.first_name or "Клиент")
+    user = get_or_create_user(message)
     try:
         raw_phone = message.text.split(maxsplit=1)[1]
         valid_phone = normalize_kz_phone(raw_phone)
         if valid_phone:
-            db.save_user_phone(message.chat.id, valid_phone)
+            user.phone = valid_phone  # Сохраняем в атрибут объекта
+            db.save_user_phone(message.chat.id, valid_phone)  # И в БД
             bot.send_message(message.chat.id, f"✅ Телефон сохранён: `{valid_phone}`", parse_mode="Markdown")
         else:
             bot.send_message(message.chat.id, "❌ Неверный номер. Пример: `+7 701 123 4567` или `87011234567`.", parse_mode="Markdown")
@@ -111,18 +135,17 @@ def handle_phone(message):
 
 @bot.message_handler(commands=["stats"])
 def handle_stats(message):
-    stats = db.get_user_stats(message.chat.id)
-    msg = (
-        f"👤 Клиент: {stats['name']}\n"
-        f"📞 Телефон: {stats['phone']}\n"
-        f"📊 Запросов: {stats['interactions']}\n"
-        f"🛒 В корзине: {stats['cart_items']} шт."
-    )
-    bot.send_message(message.chat.id, msg)
+    """Использование методов объекта класса UserProfile (ЛР 5.2)."""
+    user = get_or_create_user(message)
+    cart = db.get_user_cart(message.chat.id)
+    cart_count = sum(i["quantity"] for i in cart)
+    
+    # Вызываем метод объекта get_info()
+    bot.send_message(message.chat.id, user.get_info(cart_count))
 
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
-    db.register_user(message.chat.id, message.from_user.first_name or "Клиент")
+    get_or_create_user(message)
     try:
         photo = message.photo[-1]
         file_info = bot.get_file(photo.file_id)
@@ -142,12 +165,12 @@ def handle_photo(message):
 
 @bot.message_handler(content_types=["text"])
 def handle_text(message):
-    db.register_user(message.chat.id, message.from_user.first_name or "Клиент")
-    text = message.text.strip()
+    get_or_create_user(message)
+    raw_text = message.text.strip().lower()
 
-    if text == "🍏 Каталог":
+    if message.text == "🍏 Каталог":
         handle_catalog(message)
-    elif text == "🛒 Моя корзина":
+    elif message.text == "🛒 Моя корзина":
         cart = db.get_user_cart(message.chat.id)
         if not cart:
             bot.send_message(message.chat.id, "Корзина пуста.")
@@ -156,12 +179,15 @@ def handle_text(message):
         total_fmt = f"{total:,}".replace(",", " ")
         items = "\n".join([f"• {i['name']} x{i['quantity']} — {i['subtotal']:,} ₸".replace(",", " ") for i in cart])
         bot.send_message(message.chat.id, f"🛒 **Корзина:**\n{items}\n\n**Итого:** {total_fmt} ₸\n\nОформить: /order", parse_mode="Markdown")
-    elif text == "📦 Оформить заказ":
+    elif message.text == "📦 Оформить заказ":
         handle_order(message)
+    # Полиморфизм из ЛР 5.2 (вызов метода reply() у нужного класса)
+    elif raw_text in answers_map:
+        bot.send_message(message.chat.id, answers_map[raw_text].reply())
     else:
         bot.send_chat_action(message.chat.id, "typing")
-        reply = query_ai_sales_manager(text)
+        reply = query_ai_sales_manager(message.text)
         bot.send_message(message.chat.id, reply)
 
-print("🚀 БОТ УСПЕШНО ЗАПУЩЕН! ЖДУ СООБЩЕНИЙ В TELEGRAM...")
+print("🚀 Бот успешно запущен (с классами ООП и базой данных SQLite)...")
 bot.infinity_polling()
